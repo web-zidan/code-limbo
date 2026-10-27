@@ -1,0 +1,72 @@
+name: Inspect split source archive
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/inspect-split-archive.yml"
+      - "code-bahan.zip.001"
+      - "code-bahan.zip.002"
+permissions:
+  contents: write
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reassemble and inspect archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s code-bahan.zip.001
+          test -s code-bahan.zip.002
+          cat code-bahan.zip.001 code-bahan.zip.002 > /tmp/code-bahan.zip
+          python3 - <<'PY'
+          from pathlib import Path, PurePosixPath
+          from zipfile import ZipFile, BadZipFile
+          import collections
+          src = Path("/tmp/code-bahan.zip")
+          out = Path("archive-manifest.txt")
+          try:
+              with ZipFile(src) as z:
+                  infos = z.infolist()
+                  bad = z.testzip()
+                  if bad:
+                      raise SystemExit(f"ZIP CRC error in {bad}")
+          except BadZipFile as e:
+              raise SystemExit(f"Concatenated parts are not a valid single ZIP: {e}")
+          tops = collections.Counter()
+          extensions = collections.Counter()
+          total_size = 0
+          lines = [
+              "Split archive inspection",
+              f"Archive bytes: {src.stat().st_size}",
+              f"Entries: {len(infos)}",
+              "",
+              "Top-level entries:",
+          ]
+          for i in infos:
+              p = PurePosixPath(i.filename)
+              if p.parts:
+                  tops[p.parts[0]] += 1
+              if not i.is_dir():
+                  total_size += i.file_size
+                  ext = p.suffix.lower() or "[no extension]"
+                  extensions[ext] += 1
+          for name, count in tops.most_common():
+              lines.append(f"{count:6}  {name}")
+          lines += ["", f"Uncompressed file bytes: {total_size}", "", "Files likely relevant to build (path and uncompressed bytes):"]
+          patterns = ("qemu", "glib", "pixman", "sdl", "libffi", "ovmf", "bios", "seabios", "gradlew", "build.gradle", "android-limbo-config", "patches/")
+          hits = [i for i in infos if not i.is_dir() and any(q in i.filename.lower() for q in patterns)]
+          for i in sorted(hits, key=lambda x: x.filename.lower()):
+              lines.append(f"{i.file_size:12}  {i.filename}")
+          out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          print("\n".join(lines[:80]))
+          PY
+      - name: Commit manifest
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add archive-manifest.txt
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Inspect split source archive contents"
+          git push origin HEAD:main
